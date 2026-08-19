@@ -1,5 +1,6 @@
 """Representation of a OCPP 1.6 charging station."""
 
+import asyncio
 from datetime import datetime, timedelta, UTC
 import logging
 
@@ -149,132 +150,72 @@ class ChargePoint(cp):
     async def get_heartbeat_interval(self):
         """Retrieve heartbeat interval from the charger and store it."""
         await self.get_configuration(ckey.heartbeat_interval.value)
-
+        
     async def get_supported_measurands(self) -> str:
         """Get comma-separated list of measurands supported by the charger."""
+        all_measurands = self.settings.monitored_variables
+        autodetect_measurands = self.settings.monitored_variables_autoconfig
 
-        def _filter_measurands(raw_csv: str) -> str:
-            """Keep only compliant measurands found as tokens in the charger's string."""
-            # Protect against empty lists and the "Unknown" sentinel (checked by test_measurands_manual_set_rejected_returns_empty)
-            if not raw_csv or raw_csv.strip().lower() == "unknown":
-                return ""
-
-            matched = []
-            for token in raw_csv.split(","):
-                token = token.strip()
-                if not token:
-                    continue
-
-                for m in MEASURANDS:
-                    # Token-aware match: Exact match OR prefix match with a dot (e.g. "Voltage.L1")
-                    if token == m or token.startswith(f"{m}."):
-                        if m not in matched:
-                            matched.append(m)
-                        break  # Match found for this token, move to the next one
-
-            if not matched:
-                _LOGGER.debug(
-                    "Charger '%s' returned no valid measurands; falling back to %s.",
-                    self.id,
-                    DEFAULT_MEASURAND,
-                )
-                return DEFAULT_MEASURAND
-
-            return ",".join(matched)
-
-        all_measurands = self.settings.monitored_variables or ""
-        autodetect_measurands = bool(self.settings.monitored_variables_autoconfig)
         key = ckey.meter_values_sampled_data.value
 
-        desired_csv = all_measurands.strip().strip(",")
-        cfg_ok = {ConfigurationStatus.accepted, ConfigurationStatus.reboot_required}
-
-        effective_csv: str = ""
-
         if autodetect_measurands:
-            if desired_csv:
-                _LOGGER.debug(
-                    "'%s' attempting CSV set for measurands: %s", self.id, desired_csv
-                )
+            accepted_measurands = []
+            cfg_ok = [
+                ConfigurationStatus.accepted,
+                ConfigurationStatus.reboot_required,
+            ]
+
+            for measurand in all_measurands.split(","):
+                _LOGGER.debug(f"'{self.id}' trying measurand: '{measurand}'")
                 try:
-                    resp = await self.call(
-                        call.ChangeConfiguration(key=key, value=desired_csv)
+                    req = call.ChangeConfiguration(key=key, value=measurand)
+                    resp = await self.call(req)
+                    if resp.status in cfg_ok:
+                        _LOGGER.debug(f"'{self.id}' adding measurand: '{measurand}'")
+                        accepted_measurands.append(measurand)
+                except asyncio.TimeoutError:
+                    _LOGGER.warning(
+                        f"'{self.id}' timeout on measurand '{measurand}', skipping"
                     )
-                    if getattr(resp, "status", None) in cfg_ok:
-                        _LOGGER.debug(
-                            "'%s' measurands CSV accepted with status=%s",
-                            self.id,
-                            resp.status,
-                        )
-                        effective_csv = desired_csv
-                    else:
-                        _LOGGER.debug(
-                            "'%s' measurands CSV rejected with status=%s; falling back to GetConfiguration",
-                            self.id,
-                            getattr(resp, "status", None),
-                        )
-                except Exception as ex:
+                    continue
+
+            accepted_measurands = ",".join(accepted_measurands)
+        else:
+            accepted_measurands = all_measurands
+
+            # Quirk:
+            # Workaround for a bug on chargers that have invalid MeterValuesSampledData
+            # configuration and reboot while the server requests MeterValuesSampledData.
+            # By setting the configuration directly without checking current configuration
+            # as done when calling self.configure, the server avoids charger reboot.
+            # Corresponding issue: https://github.com/lbbrhzn/ocpp/issues/1275
+            if len(accepted_measurands) > 0:
+                try:
+                    req = call.ChangeConfiguration(key=key, value=accepted_measurands)
+                    resp = await self.call(req)
                     _LOGGER.debug(
-                        "get_supported_measurands CSV set raised for '%s': %s",
-                        self.id,
-                        ex,
+                        f"'{self.id}' measurands set manually to {accepted_measurands}"
                     )
+                except asyncio.TimeoutError:
+                    _LOGGER.warning(f"'{self.id}' timeout setting measurands")
 
-            # Read from charger and filter it using lenient logic
-            chgr_csv = await self.get_configuration(key)
-            chgr_csv = _filter_measurands(chgr_csv)
+        try:
+            chgr_measurands = await self.get_configuration(key)
+        except asyncio.TimeoutError:
+            _LOGGER.warning(f"'{self.id}' timeout reading back measurands")
+            chgr_measurands = ""
 
-            if not effective_csv:
-                _LOGGER.debug(
-                    "'%s' measurands not configurable by integration", self.id
-                )
-                _LOGGER.debug("'%s' allowed measurands: '%s'", self.id, chgr_csv)
-                return chgr_csv
-
-            _LOGGER.debug(
-                "Returning accepted measurands for '%s': '%s'", self.id, effective_csv
-            )
-            await self.configure(key, effective_csv)
-            return effective_csv
-
-        # Non-autodetect path:
-        if desired_csv:
+        if len(accepted_measurands) > 0:
+            _LOGGER.debug(f"'{self.id}' allowed measurands: '{accepted_measurands}'")
             try:
-                resp = await self.call(
-                    call.ChangeConfiguration(key=key, value=desired_csv)
-                )
-                _LOGGER.debug(
-                    "'%s' measurands set manually to %s", self.id, desired_csv
-                )
-                if getattr(resp, "status", None) in cfg_ok:
-                    effective_csv = desired_csv
-                else:
-                    _LOGGER.debug(
-                        "'%s' manual measurands set not accepted (status=%s); using charger's value",
-                        self.id,
-                        getattr(resp, "status", None),
-                    )
-                    effective_csv = await self.get_configuration(key)
-            except Exception as ex:
-                _LOGGER.debug(
-                    "Manual measurands set failed for '%s': %s; using charger's value",
-                    self.id,
-                    ex,
-                )
-                effective_csv = await self.get_configuration(key)
+                await self.configure(key, accepted_measurands)
+            except asyncio.TimeoutError:
+                _LOGGER.warning(f"'{self.id}' timeout configuring measurands")
         else:
-            effective_csv = await self.get_configuration(key)
+            _LOGGER.debug(f"'{self.id}' measurands not configurable by integration")
+            _LOGGER.debug(f"'{self.id}' allowed measurands: '{chgr_measurands}'")
 
-        # Filter whatever resulted from the manual path
-        effective_csv = _filter_measurands(effective_csv)
-
-        if effective_csv:
-            _LOGGER.debug("'%s' allowed measurands: '%s'", self.id, effective_csv)
-            await self.configure(key, effective_csv)
-        else:
-            _LOGGER.debug("'%s' measurands not configurable by integration", self.id)
-
-        return effective_csv
+        return accepted_measurands
 
     async def set_standard_configuration(self):
         """Send configuration values to the charger."""
