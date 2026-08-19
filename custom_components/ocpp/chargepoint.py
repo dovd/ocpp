@@ -308,6 +308,15 @@ class ChargePoint(cp):
         self._metrics[(conn_id, csess.session_energy.value)].unit = HA_ENERGY_UNIT
         self._metrics[(conn_id, csess.meter_start.value)].unit = HA_ENERGY_UNIT
 
+    async def route_message(self, raw_msg):
+        """Repair known-malformed payloads before the library parses them."""
+        if isinstance(raw_msg, str) and '"configurationKey":]' in raw_msg:
+            _LOGGER.debug(f"'{self.id}' repairing malformed configurationKey")
+            raw_msg = raw_msg.replace(
+                '"configurationKey":]', '"configurationKey":[]'
+            )
+        await super().route_message(raw_msg)
+        
     async def get_number_of_connectors(self) -> int:
         """Return number of connectors on this charger."""
         return self.num_connectors
